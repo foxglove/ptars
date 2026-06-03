@@ -106,21 +106,19 @@ fn decode_zigzag64(v: u64) -> i64 {
 }
 
 /// Convert a `(seconds, nanos)` pair into a single `i64` count in the requested
-/// [`TimeUnit`]. Returns `None` if the conversion overflows `i64` (i.e. the value
-/// can't be represented at that precision); callers should emit an Arrow null in
-/// that case instead of panicking.
-fn convert_seconds_nanos_to_unit(seconds: i64, nanos: i32, unit: TimeUnit) -> Option<i64> {
+/// [`TimeUnit`]. Saturates to i64::MAX or i64::MIN if the conversion overflows.
+fn convert_seconds_nanos_to_unit(seconds: i64, nanos: i32, unit: TimeUnit) -> i64 {
     match unit {
-        TimeUnit::Second => Some(seconds),
+        TimeUnit::Second => seconds,
         TimeUnit::Millisecond => seconds
-            .checked_mul(1_000)
-            .and_then(|s| s.checked_add(i64::from(nanos) / 1_000_000)),
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(nanos) / 1_000_000),
         TimeUnit::Microsecond => seconds
-            .checked_mul(1_000_000)
-            .and_then(|s| s.checked_add(i64::from(nanos) / 1_000)),
+            .saturating_mul(1_000_000)
+            .saturating_add(i64::from(nanos) / 1_000),
         TimeUnit::Nanosecond => seconds
-            .checked_mul(1_000_000_000)
-            .and_then(|s| s.checked_add(i64::from(nanos))),
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(nanos)),
     }
 }
 
@@ -1472,10 +1470,8 @@ impl FieldDecoder {
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let vals = decode_wkt_submessage(data, 2)?;
-                match convert_seconds_nanos_to_unit(vals[0], vals[1] as i32, *unit) {
-                    Some(v) => values_builder.append_value(v),
-                    None => values_builder.append_null(),
-                }
+                let value = convert_seconds_nanos_to_unit(vals[0], vals[1] as i32, *unit);
+                values_builder.append_value(value);
                 Ok(total)
             }
             Self::RepeatedDuration {
@@ -1488,10 +1484,8 @@ impl FieldDecoder {
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let vals = decode_wkt_submessage(data, 2)?;
-                match convert_seconds_nanos_to_unit(vals[0], vals[1] as i32, *unit) {
-                    Some(v) => values_builder.append_value(v),
-                    None => values_builder.append_null(),
-                }
+                let value = convert_seconds_nanos_to_unit(vals[0], vals[1] as i32, *unit);
+                values_builder.append_value(value);
                 Ok(total)
             }
             Self::RepeatedDate { values_builder, .. } => {
@@ -1524,10 +1518,8 @@ impl FieldDecoder {
                 let (data, total) = read_length_delimited(buf)?;
                 let vals = decode_wkt_submessage(data, 4)?;
                 let total_seconds = vals[0] * 3600 + vals[1] * 60 + vals[2];
-                match convert_seconds_nanos_to_unit(total_seconds, vals[3] as i32, *unit) {
-                    Some(v) => values_builder.append_value(v),
-                    None => values_builder.append_null(),
-                }
+                let value = convert_seconds_nanos_to_unit(total_seconds, vals[3] as i32, *unit);
+                values_builder.append_value(value);
                 Ok(total)
             }
             Self::RepeatedWrapperDouble { values_builder, .. } => {
@@ -1812,10 +1804,7 @@ impl FieldDecoder {
                 ..
             } => {
                 if *has_value {
-                    match convert_seconds_nanos_to_unit(*seconds, *nanos, *unit) {
-                        Some(v) => builder.append_value(v),
-                        None => builder.append_null(),
-                    }
+                    builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
@@ -1832,10 +1821,7 @@ impl FieldDecoder {
                 ..
             } => {
                 if *has_value {
-                    match convert_seconds_nanos_to_unit(*seconds, *nanos, *unit) {
-                        Some(v) => builder.append_value(v),
-                        None => builder.append_null(),
-                    }
+                    builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
@@ -1882,10 +1868,11 @@ impl FieldDecoder {
                     let total_seconds = i64::from(*hours) * 3600
                         + i64::from(*minutes) * 60
                         + i64::from(*seconds_val);
-                    match convert_seconds_nanos_to_unit(total_seconds, *nanos, *unit) {
-                        Some(v) => builder.append_value(v),
-                        None => builder.append_null(),
-                    }
+                    builder.append_value(convert_seconds_nanos_to_unit(
+                        total_seconds,
+                        *nanos,
+                        *unit,
+                    ));
                 } else {
                     builder.append_null();
                 }
