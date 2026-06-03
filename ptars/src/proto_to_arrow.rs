@@ -2905,7 +2905,7 @@ impl MessageDecoder {
         }
     }
 
-    fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+    pub fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
         let mut pos = 0;
         while pos < buf.len() {
             let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
@@ -2961,7 +2961,7 @@ impl MessageDecoder {
         }
     }
 
-    fn decode_null_row(&mut self) {
+    pub fn decode_null_row(&mut self) {
         for (decoder, _) in &mut self.decoders {
             decoder.flush();
         }
