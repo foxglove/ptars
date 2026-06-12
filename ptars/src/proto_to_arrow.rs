@@ -178,28 +178,50 @@ impl StringBuilderInner {
 }
 
 enum BinaryBuilderInner {
-    Regular(BinaryBuilder),
-    Large(LargeBinaryBuilder),
+    Regular {
+        builder: BinaryBuilder,
+        mask: bool,
+    },
+    Large {
+        builder: LargeBinaryBuilder,
+        mask: bool,
+    },
 }
 
 impl BinaryBuilderInner {
-    fn new(use_large: bool) -> Self {
+    fn new(use_large: bool, mask: bool) -> Self {
         if use_large {
-            Self::Large(LargeBinaryBuilder::new())
+            Self::Large {
+                builder: LargeBinaryBuilder::new(),
+                mask,
+            }
         } else {
-            Self::Regular(BinaryBuilder::new())
+            Self::Regular {
+                builder: BinaryBuilder::new(),
+                mask,
+            }
         }
     }
+    /// When the builder is in mask mode, every appended value is replaced
+    /// with a null entry so the resulting array is all nulls.
     fn append_value(&mut self, v: &[u8]) {
         match self {
-            Self::Regular(b) => b.append_value(v),
-            Self::Large(b) => b.append_value(v),
+            Self::Regular {
+                builder,
+                mask: true,
+            } => builder.append_null(),
+            Self::Large {
+                builder,
+                mask: true,
+            } => builder.append_null(),
+            Self::Regular { builder, .. } => builder.append_value(v),
+            Self::Large { builder, .. } => builder.append_value(v),
         }
     }
     fn append_null(&mut self) {
         match self {
-            Self::Regular(b) => b.append_null(),
-            Self::Large(b) => b.append_null(),
+            Self::Regular { builder, .. } => builder.append_null(),
+            Self::Large { builder, .. } => builder.append_null(),
         }
     }
     fn append_default(&mut self) {
@@ -207,14 +229,19 @@ impl BinaryBuilderInner {
     }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
-            Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
-            Self::Large(b) => Arc::new(std::mem::take(b).finish()),
+            Self::Regular { builder, .. } => Arc::new(std::mem::take(builder).finish()),
+            Self::Large { builder, .. } => Arc::new(std::mem::take(builder).finish()),
         }
     }
     fn len(&self) -> usize {
         match self {
-            Self::Regular(b) => ArrayBuilder::len(b),
-            Self::Large(b) => ArrayBuilder::len(b),
+            Self::Regular { builder, .. } => ArrayBuilder::len(builder),
+            Self::Large { builder, .. } => ArrayBuilder::len(builder),
+        }
+    }
+    fn is_masked(&self) -> bool {
+        match self {
+            Self::Regular { mask, .. } | Self::Large { mask, .. } => *mask,
         }
     }
 }
@@ -2262,6 +2289,18 @@ impl FieldDecoder {
         }
     }
 
+    /// Returns true when this decoder produces a column that must be nullable
+    /// because `mask_binary_fields` is enabled and the column type is Binary.
+    /// Used to override the default singular-field nullability calculation.
+    fn forces_nullable(&self) -> bool {
+        match self {
+            Self::Bytes { builder, .. }
+            | Self::EnumBinary { builder, .. }
+            | Self::WrapperBytes { builder, .. } => builder.is_masked(),
+            _ => false,
+        }
+    }
+
     fn finish(&mut self, nullable: bool) -> (Field, Arc<dyn Array>) {
         // This is called by MessageDecoder::finish, which provides the field name separately
         // We return a dummy field name here; the caller replaces it.
@@ -2990,7 +3029,7 @@ impl MessageDecoder {
                 } else if field_desc.is_map() {
                     self.map_nullable
                 } else {
-                    field_desc.supports_presence()
+                    field_desc.supports_presence() || decoder.forces_nullable()
                 };
                 let (_, array) = decoder.finish(nullable);
                 let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
@@ -3122,7 +3161,7 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
             value: Vec::new(),
             has_value: false,
             has_presence,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: BinaryBuilderInner::new(config.use_large_binary, config.mask_binary_fields),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
@@ -3142,7 +3181,10 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
                 value: 0,
                 has_value: false,
                 has_presence,
-                builder: BinaryBuilderInner::new(config.use_large_binary),
+                builder: BinaryBuilderInner::new(
+                    config.use_large_binary,
+                    config.mask_binary_fields,
+                ),
                 enum_descriptor: enum_desc,
             }),
         },
@@ -3229,7 +3271,7 @@ fn build_message_field_decoder(
         "google.protobuf.BytesValue" => Some(FieldDecoder::WrapperBytes {
             value: Vec::new(),
             has_value: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: BinaryBuilderInner::new(config.use_large_binary, config.mask_binary_fields),
         }),
         _ => {
             let sub_decoder = MessageDecoder::new(&msg_desc, config);
@@ -3333,10 +3375,13 @@ fn build_repeated_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Opti
             list_nullable: lnb,
         }),
         Kind::Bytes => Some(FieldDecoder::RepeatedBytes {
-            values_builder: BinaryBuilderInner::new(config.use_large_binary),
+            values_builder: BinaryBuilderInner::new(
+                config.use_large_binary,
+                config.mask_binary_fields,
+            ),
             offsets: offsets(),
             list_name: ln,
-            list_nullable: lnb,
+            list_nullable: lnb || config.mask_binary_fields,
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::RepeatedEnumInt32 {
@@ -3353,10 +3398,13 @@ fn build_repeated_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Opti
                 enum_descriptor: enum_desc,
             }),
             EnumRepr::Binary => Some(FieldDecoder::RepeatedEnumBinary {
-                values_builder: BinaryBuilderInner::new(config.use_large_binary),
+                values_builder: BinaryBuilderInner::new(
+                    config.use_large_binary,
+                    config.mask_binary_fields,
+                ),
                 offsets: offsets(),
                 list_name: ln,
-                list_nullable: lnb,
+                list_nullable: lnb || config.mask_binary_fields,
                 enum_descriptor: enum_desc,
             }),
         },
@@ -3451,10 +3499,13 @@ fn build_repeated_message_decoder(
             list_nullable: lnb,
         }),
         "google.protobuf.BytesValue" => Some(FieldDecoder::RepeatedWrapperBytes {
-            values_builder: BinaryBuilderInner::new(config.use_large_binary),
+            values_builder: BinaryBuilderInner::new(
+                config.use_large_binary,
+                config.mask_binary_fields,
+            ),
             offsets,
             list_name: ln,
-            list_nullable: lnb,
+            list_nullable: lnb || config.mask_binary_fields,
         }),
         _ => {
             let sub_decoder = MessageDecoder::new(msg_desc, config);
@@ -3465,6 +3516,17 @@ fn build_repeated_message_decoder(
                 list_nullable: lnb,
             })
         }
+    }
+}
+
+/// Returns true if `field` would be rendered as a Binary/LargeBinary column
+/// in Arrow under the given configuration.
+fn is_binary_arrow_field(field: &FieldDescriptor, config: &PtarsConfig) -> bool {
+    match field.kind() {
+        Kind::Bytes => true,
+        Kind::Enum(_) => matches!(config.enum_repr, EnumRepr::Binary),
+        Kind::Message(msg) => msg.full_name() == "google.protobuf.BytesValue",
+        _ => false,
     }
 }
 
@@ -3480,12 +3542,15 @@ fn build_map_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<Fi
     let key_decoder = build_singular_decoder_for_map(&key_field, config)?;
     let value_decoder = build_singular_decoder_for_map(&value_field, config)?;
 
+    let value_is_binary = is_binary_arrow_field(&value_field, config);
+
     Some(FieldDecoder::Map {
         key_decoder: Box::new(key_decoder),
         value_decoder: Box::new(value_decoder),
         offsets: vec![0],
         map_value_name: config.map_value_name.clone(),
-        map_value_nullable: config.map_value_nullable,
+        map_value_nullable: config.map_value_nullable
+            || (config.mask_binary_fields && value_is_binary),
     })
 }
 
@@ -3584,7 +3649,7 @@ fn build_singular_decoder_for_map(
             value: Vec::new(),
             has_value: false,
             has_presence: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: BinaryBuilderInner::new(config.use_large_binary, config.mask_binary_fields),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
@@ -3604,7 +3669,10 @@ fn build_singular_decoder_for_map(
                 value: 0,
                 has_value: false,
                 has_presence: false,
-                builder: BinaryBuilderInner::new(config.use_large_binary),
+                builder: BinaryBuilderInner::new(
+                    config.use_large_binary,
+                    config.mask_binary_fields,
+                ),
                 enum_descriptor: enum_desc,
             }),
         },

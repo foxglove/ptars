@@ -5467,4 +5467,135 @@ mod tests {
             Some(1)
         );
     }
+
+    // ==================== mask_binary_fields tests ====================
+
+    fn create_singular_bytes_message_descriptor() -> (DescriptorPool, MessageDescriptor) {
+        let file_descriptor = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("BytesMessage".to_string()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("payload".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Bytes.into()),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("kept".to_string()),
+                        number: Some(2),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Int32.into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pool = create_pool_with_message(file_descriptor);
+        let message_descriptor = pool.get_message_by_name("test.BytesMessage").unwrap();
+        (pool, message_descriptor)
+    }
+
+    #[test]
+    fn test_mask_binary_fields_singular_bytes() {
+        let (_pool, message_descriptor) = create_singular_bytes_message_descriptor();
+        let mut msg = DynamicMessage::new(message_descriptor.clone());
+        msg.set_field_by_name(
+            "payload",
+            Value::Bytes(prost::bytes::Bytes::from(vec![0xAA, 0xBB])),
+        );
+        msg.set_field_by_name("kept", Value::I32(7));
+
+        let config = PtarsConfig::default().with_mask_binary_fields(true);
+        let record_batch =
+            messages_to_record_batch_with_config(&[msg], &message_descriptor, &config);
+
+        let payload = record_batch.column_by_name("payload").unwrap();
+        assert_eq!(
+            payload.data_type(),
+            &arrow_schema::DataType::Binary,
+            "payload column should still be Binary"
+        );
+        let payload_field = record_batch
+            .schema()
+            .field_with_name("payload")
+            .unwrap()
+            .clone();
+        assert!(
+            payload_field.is_nullable(),
+            "payload column must be nullable when masked"
+        );
+        assert_eq!(payload.null_count(), 1, "single value must be null");
+
+        // Non-binary columns are untouched.
+        let kept = record_batch
+            .column_by_name("kept")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(kept.value(0), 7);
+    }
+
+    #[test]
+    fn test_mask_binary_fields_repeated_bytes() {
+        let (_pool, message_descriptor) = create_repeated_message_descriptor("values", Type::Bytes);
+        let mut msg = DynamicMessage::new(message_descriptor.clone());
+        msg.set_field_by_name(
+            "values",
+            Value::List(vec![
+                Value::Bytes(prost::bytes::Bytes::from(vec![1, 2])),
+                Value::Bytes(prost::bytes::Bytes::from(vec![3, 4])),
+                Value::Bytes(prost::bytes::Bytes::from(vec![5, 6])),
+            ]),
+        );
+
+        let config = PtarsConfig::default().with_mask_binary_fields(true);
+        let record_batch =
+            messages_to_record_batch_with_config(&[msg], &message_descriptor, &config);
+
+        let column = record_batch.column_by_name("values").unwrap();
+        let list_array = column
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("repeated bytes maps to ListArray");
+
+        let inner_field = match list_array.data_type() {
+            arrow_schema::DataType::List(field) => field.clone(),
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(inner_field.data_type(), &arrow_schema::DataType::Binary);
+        assert!(
+            inner_field.is_nullable(),
+            "list element must be nullable when masked"
+        );
+
+        let inner = list_array.values();
+        assert_eq!(inner.len(), 3);
+        assert_eq!(inner.null_count(), 3, "all elements must be nulls");
+    }
+
+    #[test]
+    fn test_mask_binary_fields_default_off_preserves_values() {
+        let (_pool, message_descriptor) = create_singular_bytes_message_descriptor();
+        let mut msg = DynamicMessage::new(message_descriptor.clone());
+        msg.set_field_by_name(
+            "payload",
+            Value::Bytes(prost::bytes::Bytes::from(vec![0xAA, 0xBB])),
+        );
+        let record_batch = messages_to_record_batch(&[msg], &message_descriptor);
+        let payload = record_batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        assert_eq!(payload.value(0), &[0xAA, 0xBB]);
+    }
 }

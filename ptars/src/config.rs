@@ -63,6 +63,13 @@ pub struct PtarsConfig {
     /// When String, use_large_string controls Utf8 vs LargeUtf8.
     /// When Binary, use_large_binary controls Binary vs LargeBinary.
     pub enum_repr: EnumRepr,
+
+    /// When true, every column whose Arrow type would be Binary or LargeBinary
+    /// (singular `bytes`, repeated `bytes`, `google.protobuf.BytesValue`,
+    /// or enum fields rendered with `EnumRepr::Binary`, including inside maps
+    /// and lists) is rendered as nullable and all of its values are written
+    /// as nulls. Default: false.
+    pub mask_binary_fields: bool,
 }
 
 impl Default for PtarsConfig {
@@ -82,6 +89,7 @@ impl Default for PtarsConfig {
             use_large_binary: false,
             use_large_list: false,
             enum_repr: EnumRepr::default(),
+            mask_binary_fields: false,
         }
     }
 }
@@ -175,6 +183,13 @@ impl PtarsConfig {
         self.enum_repr = repr;
         self
     }
+
+    /// Set whether all binary/bytes columns should be rendered as nullable
+    /// and have their values masked to null.
+    pub fn with_mask_binary_fields(mut self, mask: bool) -> Self {
+        self.mask_binary_fields = mask;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +213,7 @@ mod tests {
         assert!(!config.use_large_binary);
         assert!(!config.use_large_list);
         assert_eq!(config.enum_repr, EnumRepr::Int32);
+        assert!(!config.mask_binary_fields);
     }
 
     #[test]
@@ -288,6 +304,12 @@ mod tests {
     }
 
     #[test]
+    fn test_with_mask_binary_fields() {
+        let config = PtarsConfig::new().with_mask_binary_fields(true);
+        assert!(config.mask_binary_fields);
+    }
+
+    #[test]
     fn test_builder_chaining() {
         let config = PtarsConfig::new()
             .with_timestamp_tz(Some("Europe/London"))
@@ -303,7 +325,8 @@ mod tests {
             .with_use_large_string(true)
             .with_use_large_binary(true)
             .with_use_large_list(true)
-            .with_enum_repr(EnumRepr::String);
+            .with_enum_repr(EnumRepr::String)
+            .with_mask_binary_fields(true);
 
         assert_eq!(config.timestamp_tz, Some(Arc::from("Europe/London")));
         assert_eq!(config.timestamp_unit, TimeUnit::Millisecond);
@@ -319,5 +342,6 @@ mod tests {
         assert!(config.use_large_binary);
         assert!(config.use_large_list);
         assert_eq!(config.enum_repr, EnumRepr::String);
+        assert!(config.mask_binary_fields);
     }
 }
