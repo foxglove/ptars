@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
@@ -904,6 +905,27 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 // ---------------------------------------------------------------------------
 
 impl FieldDecoder {
+    /// See `MessageDecoder::needs_all_occurrences`.
+    fn needs_all_occurrences(&self) -> bool {
+        matches!(self, Self::Message { sub_decoder, .. } if sub_decoder.needs_all_occurrences())
+    }
+
+    /// Decode a singular message field's content, without its tag and length. See
+    /// `MessageDecoder::decode_message_bytes` for what `data` must hold.
+    fn decode_message_content(&mut self, data: &[u8]) -> Result<(), prost::DecodeError> {
+        match self {
+            Self::Message {
+                sub_decoder,
+                has_value,
+                ..
+            } => {
+                *has_value = true;
+                sub_decoder.decode_message_bytes(data)
+            }
+            _ => unreachable!("only singular message fields have message content"),
+        }
+    }
+
     fn decode(&mut self, wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
         match self {
             Self::Int32 {
@@ -1290,22 +1312,12 @@ impl FieldDecoder {
                 Ok(total)
             }
             // Nested message
-            Self::Message {
-                sub_decoder,
-                has_value,
-                ..
-            } => {
+            Self::Message { .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                // For singular messages, if seen multiple times, the spec says merge.
-                // For simplicity (and matching DynamicMessage behavior), we decode fresh each time.
-                // Reset sub_decoder if already decoded this row.
-                if !*has_value {
-                    *has_value = true;
-                }
-                sub_decoder.decode_message_bytes(data)?;
+                self.decode_message_content(data)?;
                 Ok(total)
             }
             // Repeated fields
@@ -2861,9 +2873,124 @@ fn decode_repeated_wrapper_fixed64<T: ArrowPrimitiveType>(
 // MessageDecoder
 // ---------------------------------------------------------------------------
 
+fn decoder_index(tag_map: &[Option<usize>], field_num: u32) -> Option<usize> {
+    tag_map.get(field_num as usize).copied().flatten()
+}
+
+/// The fields of a message that decode after its other fields: the members of each oneof, and the
+/// singular message fields that need all their occurrences.
+struct Deferral {
+    /// For each field decoder, its index in `deferred` and its wire type, if it is deferred. The
+    /// members of a oneof share an index, so a later member displaces the earlier ones.
+    slots: Vec<Option<(usize, u8)>>,
+    /// Scratch space for `decode`.
+    deferred: Vec<Deferred>,
+}
+
+/// Occurrences of a deferred field.
+#[derive(Default)]
+struct Deferred {
+    /// The index of the field decoder the occurrences belong to.
+    field: Option<usize>,
+    /// The value of each occurrence, after its tag, as a range of the message's bytes.
+    values: Vec<Range<usize>>,
+}
+
+impl Deferral {
+    /// The deferral for a message's field decoders, if any of them are deferred.
+    fn new(
+        descriptor: &MessageDescriptor,
+        decoders: &[(FieldDecoder, FieldDescriptor)],
+    ) -> Option<Box<Self>> {
+        // One-member oneofs, such as proto3 `optional` fields, have nothing to displace.
+        let oneofs: Vec<_> = descriptor
+            .oneofs()
+            .filter(|oneof| oneof.fields().len() > 1)
+            .collect();
+        let mut deferred: Vec<Deferred> = oneofs.iter().map(|_| Deferred::default()).collect();
+        let mut slots = Vec::with_capacity(decoders.len());
+        for (decoder, field) in decoders {
+            let oneof = field
+                .containing_oneof()
+                .and_then(|oneof| oneofs.iter().position(|o| *o == oneof));
+            let slot = if oneof.is_some() {
+                oneof
+            } else if decoder.needs_all_occurrences() {
+                deferred.push(Deferred::default());
+                Some(deferred.len() - 1)
+            } else {
+                None
+            };
+            slots.push(slot.map(|slot| (slot, field.kind().wire_type() as u8)));
+        }
+        (!deferred.is_empty()).then(|| Box::new(Self { slots, deferred }))
+    }
+
+    /// `MessageDecoder::decode_message_bytes` for a message with deferred fields. Arrow builders
+    /// can't be rolled back, so deferred fields decode only once the occurrences that count are
+    /// known.
+    fn decode(
+        &mut self,
+        decoders: &mut [(FieldDecoder, FieldDescriptor)],
+        tag_map: &[Option<usize>],
+        buf: &[u8],
+    ) -> Result<(), prost::DecodeError> {
+        for deferred in &mut self.deferred {
+            deferred.field = None;
+            deferred.values.clear();
+        }
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
+            pos += n;
+            let Some(idx) = decoder_index(tag_map, field_num) else {
+                pos += skip_field(wire_type, &buf[pos..])?;
+                continue;
+            };
+            let Some((slot, field_wire_type)) = self.slots[idx] else {
+                pos += decoders[idx].0.decode(wire_type, &buf[pos..])?;
+                continue;
+            };
+            let len = skip_field(wire_type, &buf[pos..])?;
+            // The field decoders skip an occurrence with the wrong wire type, so it doesn't count.
+            if wire_type == field_wire_type {
+                let deferred = &mut self.deferred[slot];
+                if deferred.field != Some(idx) {
+                    deferred.field = Some(idx);
+                    deferred.values.clear();
+                }
+                deferred.values.push(pos..pos + len);
+            }
+            pos += len;
+        }
+
+        for deferred in &self.deferred {
+            let Some(idx) = deferred.field else {
+                continue;
+            };
+            let decoder = &mut decoders[idx].0;
+            if deferred.values.len() > 1 && decoder.needs_all_occurrences() {
+                let mut content = Vec::new();
+                for value in &deferred.values {
+                    content.extend_from_slice(read_length_delimited(&buf[value.clone()])?.0);
+                }
+                decoder.decode_message_content(&content)?;
+            } else if let Some((_, wire_type)) = self.slots[idx] {
+                for value in &deferred.values {
+                    decoder.decode(wire_type, &buf[value.clone()])?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct MessageDecoder {
     decoders: Vec<(FieldDecoder, FieldDescriptor)>,
     tag_map: Vec<Option<usize>>,
+    /// Boxed, because most messages have none and every `FieldDecoder` is as large as its
+    /// largest variant.
+    deferral: Option<Box<Deferral>>,
     list_nullable: bool,
     map_nullable: bool,
     num_rows: usize,
@@ -2882,6 +3009,7 @@ impl MessageDecoder {
                 decoders.push((decoder, field));
             }
         }
+        let deferral = Deferral::new(descriptor, &decoders);
 
         let mut tag_map = vec![
             None;
@@ -2899,6 +3027,7 @@ impl MessageDecoder {
         Self {
             decoders,
             tag_map,
+            deferral,
             list_nullable: config.list_nullable,
             map_nullable: config.map_nullable,
             num_rows: 0,
@@ -2906,21 +3035,7 @@ impl MessageDecoder {
     }
 
     pub fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
-        let mut pos = 0;
-        while pos < buf.len() {
-            let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
-            pos += n;
-            let idx = if (field_num as usize) < self.tag_map.len() {
-                self.tag_map[field_num as usize]
-            } else {
-                None
-            };
-            if let Some(idx) = idx {
-                pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
-            } else {
-                pos += skip_field(wire_type, &buf[pos..])?;
-            }
-        }
+        self.decode_message_bytes(buf)?;
         for (decoder, _) in &mut self.decoders {
             decoder.flush();
         }
@@ -2928,19 +3043,24 @@ impl MessageDecoder {
         Ok(())
     }
 
-    /// Decode a submessage's bytes without flushing — used for singular message fields
-    /// where the parent will call flush.
+    /// Whether `decode_message_bytes` must see all of a message's occurrences at once: when the
+    /// message has a oneof, directly or through singular message fields, a oneof split across
+    /// occurrences would otherwise keep more than one member.
+    fn needs_all_occurrences(&self) -> bool {
+        self.deferral.is_some()
+    }
+
+    /// Decode a message's fields into their field decoders, without flushing. When
+    /// `needs_all_occurrences`, `buf` must hold all of the message's occurrences.
     fn decode_message_bytes(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+        if let Some(deferral) = &mut self.deferral {
+            return deferral.decode(&mut self.decoders, &self.tag_map, buf);
+        }
         let mut pos = 0;
         while pos < buf.len() {
             let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
             pos += n;
-            let idx = if (field_num as usize) < self.tag_map.len() {
-                self.tag_map[field_num as usize]
-            } else {
-                None
-            };
-            if let Some(idx) = idx {
+            if let Some(idx) = decoder_index(&self.tag_map, field_num) {
                 pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;

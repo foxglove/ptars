@@ -6,10 +6,10 @@ mod tests {
         binary_array_to_messages, binary_array_to_record_batch_direct, messages_to_record_batch,
         messages_to_record_batch_with_config,
     };
-    use arrow::array::Array;
+    use arrow::array::{Array, BinaryArray};
     use prost_reflect::prost_types::{
         field_descriptor_proto::{Label, Type},
-        DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, OneofDescriptorProto,
     };
     use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value};
 
@@ -5465,6 +5465,138 @@ mod tests {
                 .unwrap()
                 .as_enum_number(),
             Some(1)
+        );
+    }
+
+    /// `Inner { int32 x = 1; int32 y = 2; }`,
+    /// `OneofTest { oneof test { int32 i = 1; string s = 2; Inner m = 3; } int32 z = 4; }`,
+    /// `Outer { OneofTest t = 1; }`, and `Outer2 { Outer o = 1; }`.
+    fn create_oneof_pool() -> DescriptorPool {
+        fn field(name: &str, number: i32, r#type: Type) -> FieldDescriptorProto {
+            FieldDescriptorProto {
+                name: Some(name.to_string()),
+                number: Some(number),
+                label: Some(Label::Optional.into()),
+                r#type: Some(r#type.into()),
+                ..Default::default()
+            }
+        }
+        fn message_field(name: &str, number: i32, type_name: &str) -> FieldDescriptorProto {
+            FieldDescriptorProto {
+                type_name: Some(type_name.to_string()),
+                ..field(name, number, Type::Message)
+            }
+        }
+        fn oneof_member(field: FieldDescriptorProto) -> FieldDescriptorProto {
+            FieldDescriptorProto {
+                oneof_index: Some(0),
+                ..field
+            }
+        }
+        fn message(name: &str, field: Vec<FieldDescriptorProto>) -> DescriptorProto {
+            DescriptorProto {
+                name: Some(name.to_string()),
+                field,
+                ..Default::default()
+            }
+        }
+
+        create_pool_with_message(FileDescriptorProto {
+            name: Some("oneof.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                message(
+                    "Inner",
+                    vec![field("x", 1, Type::Int32), field("y", 2, Type::Int32)],
+                ),
+                DescriptorProto {
+                    oneof_decl: vec![OneofDescriptorProto {
+                        name: Some("test".to_string()),
+                        ..Default::default()
+                    }],
+                    ..message(
+                        "OneofTest",
+                        vec![
+                            oneof_member(field("i", 1, Type::Int32)),
+                            oneof_member(field("s", 2, Type::String)),
+                            oneof_member(message_field("m", 3, ".test.Inner")),
+                            field("z", 4, Type::Int32),
+                        ],
+                    )
+                },
+                message("Outer", vec![message_field("t", 1, ".test.OneofTest")]),
+                message("Outer2", vec![message_field("o", 1, ".test.Outer")]),
+            ],
+            ..Default::default()
+        })
+    }
+
+    /// Messages that put more than one member of a oneof on the wire must decode as
+    /// `DynamicMessage` (and the protobuf spec) does: only the last member counts, and it does
+    /// not merge with an occurrence before another member's. This holds when the members are
+    /// split across occurrences of the oneof's ancestors, which merge as one message.
+    #[test]
+    fn test_oneof_last_member_wins() {
+        const I_5: &[u8] = &[0x08, 5];
+        const I_7: &[u8] = &[0x08, 7];
+        const S_AB: &[u8] = &[0x12, 2, b'a', b'b'];
+        const S_AS_VARINT: &[u8] = &[0x10, 7];
+        const M_X_1: &[u8] = &[0x1a, 2, 0x08, 1];
+        const M_Y_2: &[u8] = &[0x1a, 2, 0x10, 2];
+        const Z_3: &[u8] = &[0x20, 3];
+        const UNKNOWN: &[u8] = &[0x48, 1];
+        let cases: &[&[&[u8]]] = &[
+            &[I_5, S_AB],
+            &[I_5, I_7],
+            &[Z_3, M_X_1, I_5],
+            &[M_X_1, I_5, M_Y_2],
+            &[M_X_1, M_Y_2],
+        ];
+        // Wraps `message` in `depth` levels of `Outer.t` or `Outer2.o`, which are both field 1.
+        fn wrap(message: &[u8], depth: usize) -> Vec<u8> {
+            (0..depth).fold(message.to_vec(), |m, _| {
+                [&[0x0a, m.len() as u8], &m[..]].concat()
+            })
+        }
+
+        let pool = create_oneof_pool();
+        let decode = |descriptor: &MessageDescriptor, raw: &BinaryArray| {
+            binary_array_to_record_batch_direct(raw, descriptor, &PtarsConfig::default()).unwrap()
+        };
+        for (name, depth) in [("test.OneofTest", 0), ("test.Outer", 1), ("test.Outer2", 2)] {
+            let descriptor = pool.get_message_by_name(name).unwrap();
+            // Wrap each part on its own, so that the oneof is split across its ancestors.
+            let raw = BinaryArray::from_iter_values(cases.iter().map(|parts| {
+                parts
+                    .iter()
+                    .flat_map(|part| wrap(part, depth))
+                    .collect::<Vec<_>>()
+            }));
+            let actual = decode(&descriptor, &raw);
+            let messages = binary_array_to_messages(&raw, &descriptor).unwrap();
+            assert_eq!(
+                actual,
+                messages_to_record_batch(&messages, &descriptor),
+                "{name}"
+            );
+            // `messages_to_record_batch` uses the decoder under test, so check independently too.
+            let round_trip = BinaryArray::from(record_batch_to_array(&actual, &descriptor));
+            assert_eq!(
+                binary_array_to_messages(&round_trip, &descriptor).unwrap(),
+                messages,
+                "{name}"
+            );
+        }
+
+        // The decoder skips a member with the wrong wire type, so it doesn't displace the others.
+        let oneof_test = pool.get_message_by_name("test.OneofTest").unwrap();
+        let with_wrong_wire_type =
+            BinaryArray::from_iter_values([[UNKNOWN, I_5, S_AS_VARINT].concat()]);
+        let without = BinaryArray::from_iter_values([I_5]);
+        assert_eq!(
+            decode(&oneof_test, &with_wrong_wire_type),
+            decode(&oneof_test, &without)
         );
     }
 }
